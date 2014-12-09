@@ -12,26 +12,26 @@
  ,ScopedTypeVariables
  ,KindSignatures
  ,GADTs
- ,RankNTypes
- ,TypeFamilies
  ,StandaloneDeriving
  ,GeneralizedNewtypeDeriving
- ,DeriveFunctor
- ,FlexibleInstances
- ,FlexibleContexts
- ,DeriveFoldable
  ,DeriveDataTypeable
+ ,TypeFamilies
  #-}
 
-module Data.Sequence (Seq, (<|), (|>), (><), index, empty, viewl, viewr, ViewL(..), ViewR(..), splitAt) where
+module Data.Sequence (Seq, (<|), (|>), (><), index, empty, viewl, viewr, ViewL(..), ViewR(..), singleton, splitAt, replicate, replicateA, replicateM, mapWithIndex,
+  fromFunction, fromList) where
 import Data.Foldable
 -- import Data.Coerce
 import Data.Monoid
-import GHC.Exts
+import qualified GHC.Exts
+import qualified Data.List
 import Data.Data
-import Prelude hiding (splitAt)
+import Prelude hiding (splitAt, replicate)
 import Control.Applicative hiding (empty)
 import Data.Traversable
+import Data.Functor.Identity
+import Control.Monad hiding (replicateM)
+import Control.DeepSeq
 
 infixr 5 `consTree`
 infixl 5 `snocTree`
@@ -46,6 +46,11 @@ data Tree23 (n::Nat) a where
   Elem :: a -> Tree23 Z a
   Node2 :: {-# UNPACK #-} !Int -> Tree23 n a -> Tree23 n a -> Tree23 (S n) a
   Node3 :: {-# UNPACK #-} !Int -> Tree23 n a -> Tree23 n a -> Tree23 n a -> Tree23 (S n) a
+
+rnf23 :: NFData a => Tree23 (n::Nat) a -> ()
+rnf23 (Elem a) = rnf a
+rnf23 (Node2 _ a b) = rnf23 a `seq` rnf23 b
+rnf23 (Node3 _ a b c) = rnf23 a `seq` rnf23 b `seq` rnf23 c
 
 traverse23 :: Applicative f => (a -> f b) -> Tree23 k a -> f (Tree23 k b)
 traverse23 f (Elem a) = Elem <$> f a
@@ -89,8 +94,14 @@ snocTree (Deep s pr m (One a)) b =
 
 newtype Seq a = Seq (FingerTree Z a)
 
+instance NFData a => NFData (Seq a) where
+  rnf (Seq t) = rnfFT t
+
 empty :: Seq a
 empty = Seq Empty
+
+singleton :: a -> Seq a
+singleton a = Seq (Single (Elem a))
 
 instance Functor Seq where
   fmap f (Seq xs) = Seq (mapFT f xs)
@@ -103,6 +114,23 @@ instance Foldable Seq where
 
 instance Traversable Seq where
   traverse f (Seq xs) = Seq <$> traverseFT f xs
+
+instance Show a => Show (Seq a) where
+    showsPrec p xs = showParen (p > 10) $
+        showString "fromList " . shows (toList xs)
+
+-- | /O(n)/. Create a sequence from a finite list of elements.
+-- There is a function 'toList' in the opposite direction for all
+-- instances of the 'Foldable' class, including 'Seq'.
+fromList        :: [a] -> Seq a
+fromList        =  Data.List.foldl' (|>) empty
+
+#if __GLASGOW_HASKELL__ >= 708
+instance GHC.Exts.IsList (Seq a) where
+    type Item (Seq a) = a
+    fromList = fromList
+    toList = toList
+#endif
 
 (<|) :: a -> Seq a -> Seq a
 a <| (Seq s) = Seq (Elem a `consTree` s)
@@ -124,6 +152,12 @@ data Digit (n::Nat) a =  One (Tree23 n a)
                        | Two (Tree23 n a) (Tree23 n a)
                        | Three(Tree23 n a) (Tree23 n a) (Tree23 n a)
                        | Four (Tree23 n a) (Tree23 n a) (Tree23 n a) (Tree23 n a)
+
+rnfDigit :: NFData a => Digit (n::Nat) a -> ()
+rnfDigit (One a) = rnf23 a
+rnfDigit (Two a b) = rnf23 a `seq` rnf23 b
+rnfDigit (Three a b c) = rnf23 a `seq` rnf23 b `seq` rnf23 c
+rnfDigit (Four a b c d) = rnf23 a `seq` rnf23 b `seq` rnf23 c `seq` rnf23 d
 
 sizeDigit :: Digit n a -> Int
 sizeDigit (One t) = size23 t
@@ -152,6 +186,11 @@ traverseDigit f (Four a b c d) = Four <$> traverse23 f a <*> traverse23 f b <*> 
 data FingerTree (n::Nat) a =  Empty
                             | Single (Tree23 n a)
                             | Deep {-# UNPACK #-} !Int (Digit n a) (FingerTree (S n) a) (Digit n a)
+
+rnfFT :: NFData a => FingerTree (n::Nat) a -> ()
+rnfFT Empty = ()
+rnfFT (Single t) = rnf23 t
+rnfFT (Deep _ pr m sf) = rnfDigit pr `seq` rnfFT m `seq` rnfDigit sf
 
 mapFT :: (a -> b) -> FingerTree n a -> FingerTree n b
 mapFT _f Empty = Empty
@@ -404,6 +443,165 @@ split i xs
                       Split l x r -> (l, consTree x r)
   | otherwise   = (xs, Empty)
 
+-- | /O(log n)/. @replicate n x@ is a sequence consisting of @n@ copies of @x@.
+replicate       :: Int -> a -> Seq a
+replicate n x
+  | n >= 0      = runIdentity (replicateA n (Identity x))
+  | otherwise   = error "replicate takes a nonnegative integer argument"
+
+-- | 'replicateA' is an 'Applicative' version of 'replicate', and makes
+-- /O(log n)/ calls to '<*>' and 'pure'.
+--
+-- > replicateA n x = sequenceA (replicate n x)
+replicateA :: Applicative f => Int -> f a -> f (Seq a)
+replicateA n x
+  | n >= 0      = Seq <$> applicativeTree n 1 (Elem <$> x)
+  | otherwise   = error "replicateA takes a nonnegative integer argument"
+
+
+-- replicate n x = runIdentity (Seq <$> applicativeTree n 1 (Elem <$> Identity x))
+
+-- | 'replicateM' is a sequence counterpart of 'Control.Monad.replicateM'.
+--
+-- > replicateM n x = sequence (replicate n x)
+replicateM :: Monad m => Int -> m a -> m (Seq a)
+replicateM n x
+  | n >= 0      = unwrapMonad (replicateA n (WrapMonad x))
+  | otherwise   = error "replicateM takes a nonnegative integer argument"
+
+-- | 'applicativeTree' takes an Applicative-wrapped construction of a
+-- piece of a FingerTree, assumed to always have the same size (which
+-- is put in the second argument), and replicates it as many times as
+-- specified.  This is a generalization of 'replicateA', which itself
+-- is a generalization of many Data.Sequence methods.
+{-# SPECIALIZE applicativeTree :: Int -> Int -> State s (Tree23 n a) -> State s (FingerTree n a) #-}
+{-# SPECIALIZE applicativeTree :: Int -> Int -> Identity (Tree23 n a) -> Identity (FingerTree n a) #-}
+-- Special note: the Identity specialization automatically does node sharing,
+-- reducing memory usage of the resulting tree to /O(log n)/.
+applicativeTree :: Applicative f => Int -> Int -> f (Tree23 n a) -> f (FingerTree n a)
+applicativeTree n mSize m = mSize `seq` case n of
+    0 -> pure Empty
+    1 -> fmap Single m
+    2 -> deepA one emptyTree one
+    3 -> deepA two emptyTree one
+    4 -> deepA two emptyTree two
+    5 -> deepA three emptyTree two
+    6 -> deepA three emptyTree three
+    7 -> deepA four emptyTree three
+    8 -> deepA four emptyTree four
+    _ -> case n `quotRem` 3 of
+           (q,0) -> deepA three (applicativeTree (q - 2) mSize' n3) three
+           (q,1) -> deepA four  (applicativeTree (q - 2) mSize' n3) three
+           (q,_) -> deepA four  (applicativeTree (q - 2) mSize' n3) four
+  where
+    one = fmap One m
+    two = liftA2 Two m m
+    three = liftA3 Three m m m
+    four = liftA3 Four m m m <*> m
+    deepA = liftA3 (Deep (n * mSize))
+    mSize' = 3 * mSize
+    n3 = liftA3 (Node3 mSize') m m m
+    emptyTree = pure Empty
+
+-- | This is essentially a clone of Control.Monad.State.Strict.
+newtype State s a = State {runState :: s -> (s, a)}
+
+instance Functor (State s) where
+    fmap = liftA
+
+instance Monad (State s) where
+    {-# INLINE return #-}
+    {-# INLINE (>>=) #-}
+    return x = State $ \ s -> (s, x)
+    m >>= k = State $ \ s -> case runState m s of
+        (s', x) -> runState (k x) s'
+
+instance Applicative (State s) where
+    pure = return
+    (<*>) = ap
+
+execState :: State s a -> s -> a
+execState m x = snd (runState m x)
+
+{-# INLINE splitTraverse #-}
+splitTraverse :: forall s a b . (Int -> s -> (s,s)) -> (s -> a -> b) -> s -> Seq a -> Seq b
+splitTraverse splt = go
+ where
+  go f s (Seq xs) = Seq $ splitTraverseTree (\s' a -> (f s' a)) s xs
+
+  splitTraverseTree :: (s -> a -> b) -> s -> FingerTree n a -> FingerTree n b
+  splitTraverseTree _f _s Empty = Empty
+  splitTraverseTree f s (Single xs) = Single $ splitTraverse23 f s xs
+  splitTraverseTree f s (Deep n pr m sf) = Deep n (splitTraverseDigit f prs pr) (splitTraverseTree f ms m) (splitTraverseDigit f sfs sf)
+    where
+      (prs, r) = splt (sizeDigit pr) s
+      (ms, sfs) = splt (n - sizeDigit pr - sizeDigit sf) r
+
+  splitTraverseDigit :: (s -> a -> b) -> s -> Digit n a -> Digit n b
+  splitTraverseDigit f s (One a) = One (splitTraverse23 f s a)
+  splitTraverseDigit f s (Two a b) = Two (splitTraverse23 f first a) (splitTraverse23 f second b)
+    where
+      (first, second) = splt (size23 a) s
+  splitTraverseDigit f s (Three a b c) = Three (splitTraverse23 f first a) (splitTraverse23 f second b) (splitTraverse23 f third c)
+    where
+      (first, r) = splt (size23 a) s
+      (second, third) = splt (size23 b) r
+  splitTraverseDigit f s (Four a b c d) = Four (splitTraverse23 f first a) (splitTraverse23 f second b) (splitTraverse23 f third c) (splitTraverse23 f fourth d)
+    where
+      (first, s') = splt (size23 a) s
+      (middle, fourth) = splt (size23 b + size23 c) s'
+      (second, third) = splt (size23 b) middle
+
+  splitTraverse23 :: (s -> a -> b) -> s -> Tree23 n a -> Tree23 n b
+  splitTraverse23 f s (Elem a) = Elem (f s a)
+  splitTraverse23 f s (Node2 ns a b) = Node2 ns (splitTraverse23 f first a) (splitTraverse23 f second b)
+    where
+      (first, second) = splt (size23 a) s
+  splitTraverse23 f s (Node3 ns a b c) = Node3 ns (splitTraverse23 f first a) (splitTraverse23 f second b) (splitTraverse23 f third c)
+    where
+      (first, r) = splt (size23 a) s
+      (second, third) = splt (size23 b) r
+
+{-# INLINABLE mapWithIndex #-}
+mapWithIndex :: (Int -> a -> b) -> Seq a -> Seq b
+mapWithIndex f = splitTraverse (\n i -> (i, i+n)) (\i a -> f i a) 0
+
+-- | /O(n)/. Convert a given sequence length and a function representing that
+-- sequence into a sequence.
+fromFunction :: Int -> (Int -> a) -> Seq a
+fromFunction len f | len < 0 = error "Data.Sequence.fromFunction called with negative len"
+                   | len == 0 = empty
+                   | otherwise = Seq $ create f 1 0 len
+ where
+  create :: (Int -> a) -> Int -> Int -> Int -> FingerTree n a
+  create = undefined
+{-
+  create b{-tree_builder-} s{-tree_size-} i{-start_index-} trees = i `seq` s `seq` case trees of
+    1 -> Single (Elem $ b i)
+    2 -> Deep (2*s) (One (Elem $ b i)) Empty (One (Elem $ b (i+s)))
+    3 -> Deep (3*s) (Two (Elem $ b i) (Elem $ b (i+s))) Empty (One (Elem $ b (i+2*s)))
+    4 -> Deep (4*s) (Two (Elem $ b i) (Elem $ b (i+s))) Empty (Two (b (i+2*s)) (b (i+3*s)))
+
+    5 -> Deep (5*s) (Three (b i) (b (i+s)) (b (i+2*s))) Empty (Two (b (i+3*s)) (b (i+4*s)))
+    6 -> Deep (5*s) (Three (b i) (b (i+s)) (b (i+2*s))) Empty (Three (b (i+3*s)) (b (i+4*s)) (b (i+5*s)))
+    _ -> case trees `quotRem` 3 of
+
+      (trees',1) -> Deep (trees*s) (Two (b i) (b (i+s)))
+                         (create b (3*s) (i+2*s) (trees'-1))
+                         (Two (b (i+(2+3*(trees'-1))*s)) (b (i+(3+3*(trees'-1))*s)))
+    _ -> case trees `quotRem` 3 of
+      (trees',1) -> Deep (trees*s) (Two (b i) (b (i+s)))
+                         (create (\j -> Node3 (3*s) (b j) (b (j+s)) (b (j+2*s))) (3*s) (i+2*s) (trees'-1))
+                         (Two (b (i+(2+3*(trees'-1))*s)) (b (i+(3+3*(trees'-1))*s)))
+      (trees',2) -> Deep (trees*s) (Three (b i) (b (i+s)) (b (i+2*s)))
+                         (create (\j -> Node3 (3*s) (b j) (b (j+s)) (b (j+2*s))) (3*s) (i+3*s) (trees'-1))
+                         (Two (b (i+(3+3*(trees'-1))*s)) (b (i+(4+3*(trees'-1))*s)))
+      (trees',0) -> Deep (trees*s) (Three (b i) (b (i+s)) (b (i+2*s)))
+                         (create (\j -> Node3 (3*s) (b j) (b (j+s)) (b (j+2*s))) (3*s) (i+3*s) (trees'-2))
+                         (Three (b (i+(3+3*(trees'-2))*s)) (b (i+(4+3*(trees'-2))*s)) (b (i+(5+3*(trees'-2))*s)))
+-}
+
+-- replicate n x = runIdentity (Seq <$> applicativeTree n 1 (Elem <$> Identity x))
 instance Monoid (Seq a) where
   mempty = empty
   mappend = (><)
